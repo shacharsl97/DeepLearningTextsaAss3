@@ -15,7 +15,7 @@ EMBEDDING_DIM = 100
 HIDDEN_DIM = 64
 EPOCHS = 5
 LEARNING_RATE = 0.01
-BATCH_SIZE = 64
+BATCH_SIZE = 50
 GPU_NUMBER = 1
 
 # === Dataset Handling ===
@@ -68,26 +68,27 @@ class BiLSTMTagger(nn.Module):
         self.hidden2tag = nn.Linear(hidden_dim * 2, tagset_size)
 
     def forward(self, sentence):
-        embeds = self.embedding(sentence)
-        seq_len = embeds.size(0)
+        embeds = self.embedding(sentence)  # Shape: (batch_size, seq_len, embedding_dim)
+        batch_size, seq_len, _ = embeds.size()
 
-        h_fwd = torch.zeros(1, self.hidden_dim)
-        c_fwd = torch.zeros(1, self.hidden_dim)
-        h_bwd = torch.zeros(1, self.hidden_dim)
-        c_bwd = torch.zeros(1, self.hidden_dim)
+        h_fwd = torch.zeros(batch_size, self.hidden_dim, device=embeds.device)
+        c_fwd = torch.zeros(batch_size, self.hidden_dim, device=embeds.device)
+        h_bwd = torch.zeros(batch_size, self.hidden_dim, device=embeds.device)
+        c_bwd = torch.zeros(batch_size, self.hidden_dim, device=embeds.device)
 
         outputs_fwd = []
         for i in range(seq_len):
-            h_fwd, c_fwd = self.lstm_fwd(embeds[i].unsqueeze(0), (h_fwd, c_fwd))
+            h_fwd, c_fwd = self.lstm_fwd(embeds[:, i, :], (h_fwd, c_fwd))  # Process each time step
             outputs_fwd.append(h_fwd)
 
         outputs_bwd = []
         for i in reversed(range(seq_len)):
-            h_bwd, c_bwd = self.lstm_bwd(embeds[i].unsqueeze(0), (h_bwd, c_bwd))
+            h_bwd, c_bwd = self.lstm_bwd(embeds[:, i, :], (h_bwd, c_bwd))  # Process each time step in reverse
             outputs_bwd.insert(0, h_bwd)
 
         outputs = [torch.cat((f, b), dim=1) for f, b in zip(outputs_fwd, outputs_bwd)]
-        tag_space = torch.stack([self.hidden2tag(o) for o in outputs])
+        outputs = torch.stack(outputs, dim=1)  # Shape: (batch_size, seq_len, hidden_dim * 2)
+        tag_space = self.hidden2tag(outputs)  # Shape: (batch_size, seq_len, tagset_size)
         return tag_space
 
 # === Utilities ===
@@ -116,7 +117,7 @@ def train_model(train_path, dev_path):
     train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True, collate_fn=TaggingDataset.collate_fn)
     dev_loader = DataLoader(dev_data, batch_size=BATCH_SIZE, shuffle=False, collate_fn=TaggingDataset.collate_fn)
 
-    log_file = f"train_log_{"pos " if "pos" in train_path else "ner"}.txt"
+    log_file = "train_log_pos.txt" if "pos" in train_path else "train_log_ner.txt"
 
     model = BiLSTMTagger(len(word_to_ix), len(tag_to_ix), EMBEDDING_DIM, HIDDEN_DIM).to(device)
     loss_function = nn.CrossEntropyLoss(ignore_index=-1)
@@ -138,7 +139,7 @@ def train_model(train_path, dev_path):
                 total_loss += loss.item()
 
                 # Log and print dev-set accuracy, time taken, and estimated time left every 500 sentences
-                if (i + 1) % 500 == 0:
+                if (i + 1) % (500 / BATCH_SIZE) == 0:
                     correct = 0
                     total = 0
                     with torch.no_grad():
@@ -146,13 +147,33 @@ def train_model(train_path, dev_path):
                             dev_sentences, dev_tags = dev_sentences.to(device), dev_tags.to(device)
                             dev_tag_scores = model(dev_sentences)
                             predicted_tags = torch.argmax(dev_tag_scores, dim=2)
-                            for pred, true in zip(predicted_tags.view(-1), dev_tags.view(-1)):
+                            # Mask to ignore padding tokens during accuracy calculation
+                            mask = dev_tags != -1  # Ignore padding tokens (where tag is -1)
+                            for pred, true in zip(predicted_tags[mask], dev_tags[mask]):
                                 if "ner" in train_path and pred.item() == tag_to_ix["O"] and true.item() == tag_to_ix["O"]:
                                     continue  # Skip cases where both are 'O' in NER
-                                if pred.item() == true.item():
-                                    correct += 1
+                                correct += (pred.item() == true.item())
                                 total += 1
                     accuracy = correct / total if total > 0 else 0
+
+                    # Calculate train accuracy on a sample of the training data
+                    correct_train = 0
+                    total_train = 0
+                    sample_size = min(len(train_loader), 10)  # Use a sample of 10 batches or less
+                    with torch.no_grad():
+                        for batch_idx, (train_sentences, train_tags) in enumerate(train_loader):
+                            if batch_idx >= sample_size:
+                                break
+                            train_sentences, train_tags = train_sentences.to(device), train_tags.to(device)
+                            train_tag_scores = model(train_sentences)
+                            predicted_train_tags = torch.argmax(train_tag_scores, dim=2)
+                            mask_train = train_tags != -1  # Ignore padding tokens
+                            for pred, true in zip(predicted_train_tags[mask_train], train_tags[mask_train]):
+                                if "ner" in train_path and pred.item() == tag_to_ix["O"] and true.item() == tag_to_ix["O"]:
+                                    continue  # Skip cases where both are 'O' in NER
+                                correct_train += (pred.item() == true.item())
+                                total_train += 1
+                    train_accuracy = correct_train / total_train if total_train > 0 else 0
 
                     elapsed_time = time.time() - start_time
                     sentences_processed = (i + 1) * BATCH_SIZE
@@ -160,8 +181,19 @@ def train_model(train_path, dev_path):
                     remaining_batches = (len(train_data) - sentences_processed) / 500
                     estimated_time_left = remaining_batches * time_per_500
 
-                    log_f.write(f"After {sentences_processed} sentences: Dev Accuracy = {accuracy:.4f}, Time = {time_per_500:.2f}s, Estimated Time Left = {estimated_time_left:.2f}s\n")
-                    print(f"After {sentences_processed} sentences: Dev Accuracy = {accuracy:.4f}, Time = {time_per_500:.2f}s, Estimated Time Left = {estimated_time_left:.2f}s")
+                    log_f.write(f"After {sentences_processed} sentences: Train Accuracy = {train_accuracy:.4f}, Dev Accuracy = {accuracy:.4f}, Time = {time_per_500:.2f}s, Estimated Time Left = {estimated_time_left:.2f}s\n")
+                    print(f"After {sentences_processed} sentences: Train Accuracy = {train_accuracy:.4f}, Dev Accuracy = {accuracy:.4f}, Time = {time_per_500:.2f}s, Estimated Time Left = {estimated_time_left:.2f}s")
+
+            # Calculate train loss at the end of the epoch
+            train_loss = 0.0
+            with torch.no_grad():
+                for train_sentences, train_tags in train_loader:
+                    train_sentences, train_tags = train_sentences.to(device), train_tags.to(device)
+                    train_tag_scores = model(train_sentences)
+                    train_loss += loss_function(train_tag_scores.view(-1, len(tag_to_ix)), train_tags.view(-1)).item()
+
+            log_f.write(f"Epoch {epoch+1}: Train Loss = {train_loss:.4f}, Dev Loss = {total_loss:.4f}\n")
+            print(f"Epoch {epoch+1}: Train Loss = {train_loss:.4f}, Dev Loss = {total_loss:.4f}")
 
             log_f.write(f"Epoch {epoch+1}: Loss = {total_loss:.4f}\n")
             print(f"Epoch {epoch+1}: Loss = {total_loss:.4f}")
