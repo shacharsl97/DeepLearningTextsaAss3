@@ -11,11 +11,13 @@ import time
 from torch.nn.utils.rnn import pad_sequence
 
 # === Hyperparameters ===
-EMBEDDING_DIM = 100
-HIDDEN_DIM = 64
+EMBEDDING_DIM = 200
+HIDDEN_DIM = 128
 EPOCHS = 5
-LEARNING_RATE = 0.01
-BATCH_SIZE = 50
+LEARNING_RATE = 0.015
+BATCH_SIZE = 200
+DROPOUT = 0.3
+
 GPU_NUMBER = 1
 
 # === Dataset Handling ===
@@ -63,14 +65,19 @@ class BiLSTMTagger(nn.Module):
         super(BiLSTMTagger, self).__init__()
         self.hidden_dim = hidden_dim
         self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        self.dropout = nn.Dropout(DROPOUT)
         self.lstm_fwd = nn.LSTMCell(embedding_dim, hidden_dim)
         self.lstm_bwd = nn.LSTMCell(embedding_dim, hidden_dim)
+        self.lstm2_fwd = nn.LSTMCell(hidden_dim * 2, hidden_dim)
+        self.lstm2_bwd = nn.LSTMCell(hidden_dim * 2, hidden_dim)
         self.hidden2tag = nn.Linear(hidden_dim * 2, tagset_size)
+        # self.layer_norm = nn.LayerNorm(hidden_dim * 2)
 
     def forward(self, sentence):
         embeds = self.embedding(sentence)  # Shape: (batch_size, seq_len, embedding_dim)
         batch_size, seq_len, _ = embeds.size()
 
+        # First BiLSTM layer
         h_fwd = torch.zeros(batch_size, self.hidden_dim, device=embeds.device)
         c_fwd = torch.zeros(batch_size, self.hidden_dim, device=embeds.device)
         h_bwd = torch.zeros(batch_size, self.hidden_dim, device=embeds.device)
@@ -88,7 +95,28 @@ class BiLSTMTagger(nn.Module):
 
         outputs = [torch.cat((f, b), dim=1) for f, b in zip(outputs_fwd, outputs_bwd)]
         outputs = torch.stack(outputs, dim=1)  # Shape: (batch_size, seq_len, hidden_dim * 2)
-        tag_space = self.hidden2tag(outputs)  # Shape: (batch_size, seq_len, tagset_size)
+
+        # Second BiLSTM layer
+        h2_fwd = torch.zeros(batch_size, self.hidden_dim, device=embeds.device)
+        c2_fwd = torch.zeros(batch_size, self.hidden_dim, device=embeds.device)
+        h2_bwd = torch.zeros(batch_size, self.hidden_dim, device=embeds.device)
+        c2_bwd = torch.zeros(batch_size, self.hidden_dim, device=embeds.device)
+
+        outputs2_fwd = []
+        for i in range(seq_len):
+            h2_fwd, c2_fwd = self.lstm2_fwd(outputs[:, i, :], (h2_fwd, c2_fwd))  # Process each time step
+            outputs2_fwd.append(h2_fwd)
+
+        outputs2_bwd = []
+        for i in reversed(range(seq_len)):
+            h2_bwd, c2_bwd = self.lstm2_bwd(outputs[:, i, :], (h2_bwd, c2_bwd))  # Process each time step in reverse
+            outputs2_bwd.insert(0, h2_bwd)
+
+        outputs2 = [torch.cat((f, b), dim=1) for f, b in zip(outputs2_fwd, outputs2_bwd)]
+        outputs2 = torch.stack(outputs2, dim=1)  # Shape: (batch_size, seq_len, hidden_dim * 2)
+        outputs2 = self.dropout(outputs2)  # Apply dropout
+        # outputs2 = self.layer_norm(outputs2)     # Apply layer normalization
+        tag_space = self.hidden2tag(outputs2)  # Shape: (batch_size, seq_len, tagset_size)
         return tag_space
 
 # === Utilities ===
@@ -107,7 +135,7 @@ def build_vocab(data_path):
     return word_to_ix, tag_to_ix
 
 # === Training Procedure ===
-def train_model(train_path, dev_path):
+def train_model(train_path, dev_path, mode):
     device = torch.device(f"cuda:{GPU_NUMBER}" if torch.cuda.is_available() else "cpu")
 
     word_to_ix, tag_to_ix = build_vocab(train_path)
@@ -121,7 +149,9 @@ def train_model(train_path, dev_path):
 
     model = BiLSTMTagger(len(word_to_ix), len(tag_to_ix), EMBEDDING_DIM, HIDDEN_DIM).to(device)
     loss_function = nn.CrossEntropyLoss(ignore_index=-1)
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=1)
+
 
     print(f"Training on {len(train_data)} sentences with {len(word_to_ix)} words\n Starting training...")
 
@@ -147,19 +177,17 @@ def train_model(train_path, dev_path):
                             dev_sentences, dev_tags = dev_sentences.to(device), dev_tags.to(device)
                             dev_tag_scores = model(dev_sentences)
                             predicted_tags = torch.argmax(dev_tag_scores, dim=2)
-                            # Mask to ignore padding tokens during accuracy calculation
-                            mask = dev_tags != -1  # Ignore padding tokens (where tag is -1)
-                            for pred, true in zip(predicted_tags[mask], dev_tags[mask]):
-                                if "ner" in train_path and pred.item() == tag_to_ix["O"] and true.item() == tag_to_ix["O"]:
-                                    continue  # Skip cases where both are 'O' in NER
-                                correct += (pred.item() == true.item())
-                                total += 1
+                            mask = dev_tags != -1
+                            if "ner" in train_path:
+                                ner_mask = ~((predicted_tags == tag_to_ix["O"]) & (dev_tags == tag_to_ix["O"]))
+                                mask &= ner_mask
+                            correct += (predicted_tags[mask] == dev_tags[mask]).sum().item()
+                            total += mask.sum().item()
                     accuracy = correct / total if total > 0 else 0
 
-                    # Calculate train accuracy on a sample of the training data
                     correct_train = 0
                     total_train = 0
-                    sample_size = min(len(train_loader), 10)  # Use a sample of 10 batches or less
+                    sample_size = min(len(train_loader), 10)
                     with torch.no_grad():
                         for batch_idx, (train_sentences, train_tags) in enumerate(train_loader):
                             if batch_idx >= sample_size:
@@ -167,13 +195,14 @@ def train_model(train_path, dev_path):
                             train_sentences, train_tags = train_sentences.to(device), train_tags.to(device)
                             train_tag_scores = model(train_sentences)
                             predicted_train_tags = torch.argmax(train_tag_scores, dim=2)
-                            mask_train = train_tags != -1  # Ignore padding tokens
-                            for pred, true in zip(predicted_train_tags[mask_train], train_tags[mask_train]):
-                                if "ner" in train_path and pred.item() == tag_to_ix["O"] and true.item() == tag_to_ix["O"]:
-                                    continue  # Skip cases where both are 'O' in NER
-                                correct_train += (pred.item() == true.item())
-                                total_train += 1
+                            mask_train = train_tags != -1
+                            if "ner" in train_path:
+                                ner_mask = ~((predicted_train_tags == tag_to_ix["O"]) & (train_tags == tag_to_ix["O"]))
+                                mask_train &= ner_mask
+                            correct_train += (predicted_train_tags[mask_train] == train_tags[mask_train]).sum().item()
+                            total_train += mask_train.sum().item()
                     train_accuracy = correct_train / total_train if total_train > 0 else 0
+
 
                     elapsed_time = time.time() - start_time
                     sentences_processed = (i + 1) * BATCH_SIZE
@@ -183,6 +212,8 @@ def train_model(train_path, dev_path):
 
                     log_f.write(f"After {sentences_processed} sentences: Train Accuracy = {train_accuracy:.4f}, Dev Accuracy = {accuracy:.4f}, Time = {time_per_500:.2f}s, Estimated Time Left = {estimated_time_left:.2f}s\n")
                     print(f"After {sentences_processed} sentences: Train Accuracy = {train_accuracy:.4f}, Dev Accuracy = {accuracy:.4f}, Time = {time_per_500:.2f}s, Estimated Time Left = {estimated_time_left:.2f}s")
+
+                    scheduler.step(accuracy)
 
             # Calculate train loss at the end of the epoch
             train_loss = 0.0
@@ -203,7 +234,7 @@ def train_model(train_path, dev_path):
 # === Entry Point ===
 if __name__ == "__main__":
     import sys
-    repr = sys.argv[1]  # Currently unused
+    mode = sys.argv[1]  # Currently unused
     trainFile = sys.argv[2]  # Path to the training file
     modelFile = sys.argv[3]  # Path to save the trained model
 
@@ -211,7 +242,7 @@ if __name__ == "__main__":
     devFile = trainFile.replace("train", "dev")
 
     # Train the model
-    model = train_model(trainFile, devFile)
+    model = train_model(trainFile, devFile, mode)
 
     # Save the trained model
     torch.save(model.state_dict(), modelFile)
