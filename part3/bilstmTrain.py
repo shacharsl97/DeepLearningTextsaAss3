@@ -12,13 +12,16 @@ from torch.nn.utils.rnn import pad_sequence
 
 # === Hyperparameters ===
 EMBEDDING_DIM = 200
+CHAR_EMBEDDING_DIM = 100
 HIDDEN_DIM = 128
 EPOCHS = 5
 LEARNING_RATE = 0.015
-BATCH_SIZE = 200
+BATCH_SIZE = 100
 DROPOUT = 0.3
 
-GPU_NUMBER = 1
+PAD_CHAR_IDX = 0
+
+GPU_NUMBER = 5
 
 # === Dataset Handling ===
 class TaggingDataset(Dataset):
@@ -59,12 +62,67 @@ class TaggingDataset(Dataset):
         tags_padded = pad_sequence(tags, batch_first=True, padding_value=-1)
         return sentences_padded, tags_padded
 
+class CharTaggingDataset(Dataset):
+    def __init__(self, data_path, char_to_ix, tag_to_ix):
+        self.sentences = []
+        self.labels = []
+        self.char_to_ix = char_to_ix
+        self.tag_to_ix = tag_to_ix
+        with open(data_path) as f:
+            sentence = []
+            tags = []
+            for line in f:
+                line = line.strip()
+                if line == "":
+                    if sentence:
+                        self.sentences.append([torch.tensor(word) for word in sentence])
+                        self.labels.append(torch.tensor(tags))
+                        sentence = []
+                        tags = []
+                else:
+                    word, tag = line.split()
+                    char_indices = [char_to_ix.get(char, char_to_ix["<UNK>"]) for char in word]
+                    sentence.append(char_indices)
+                    tags.append(tag_to_ix[tag])
+            if sentence:
+                self.sentences.append([torch.tensor(word) for word in sentence])
+                self.labels.append(torch.tensor(tags))
+
+    def __len__(self):
+        return len(self.sentences)
+
+    def __getitem__(self, idx):
+        return self.sentences[idx], self.labels[idx]
+
+    # Collate function for DataLoader
+    @staticmethod
+    def collate_fn(batch):
+        sentences, tags = zip(*batch)
+        # Find max sentence length and max word length in the batch
+        max_sent_len = max(len(s) for s in sentences)
+        max_word_len = max((len(w) for s in sentences for w in s), default=1)
+        # Pad each word to max_word_len, then pad each sentence to max_sent_len
+        padded_sentences = []
+        for s in sentences:
+            padded_words = [torch.cat([w, torch.full((max_word_len - len(w),), PAD_CHAR_IDX, dtype=torch.long)]) if len(w) < max_word_len else w[:max_word_len] for w in s]
+            # Pad sentence with PAD_CHAR_IDX words if needed
+            if len(padded_words) < max_sent_len:
+                pad_word = torch.full((max_word_len,), PAD_CHAR_IDX, dtype=torch.long)
+                padded_words += [pad_word] * (max_sent_len - len(padded_words))
+            padded_sentences.append(torch.stack(padded_words))
+        sentences_padded = torch.stack(padded_sentences)  # (batch, max_sent_len, max_word_len)
+        # Pad tags
+        tags_padded = [torch.cat([t, torch.full((max_sent_len - len(t),), -1, dtype=torch.long)]) if len(t) < max_sent_len else t[:max_sent_len] for t in tags]
+        tags_padded = torch.stack(tags_padded)
+        return sentences_padded, tags_padded
+
 # === Model Definition ===
 class BiLSTMTagger(nn.Module):
-    def __init__(self, vocab_size, tagset_size, embedding_dim, hidden_dim):
+    def __init__(self, vocab_size, char_vocab_size, prefix_vocab_size, suffix_vocab_size,
+                 tagset_size, embedding_dim, char_embedding_dim, hidden_dim, mode):
         super(BiLSTMTagger, self).__init__()
         self.hidden_dim = hidden_dim
-        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        self.embedding_dim = embedding_dim  # Save embedding_dim for char_lstm hidden state
         self.dropout = nn.Dropout(DROPOUT)
         self.lstm_fwd = nn.LSTMCell(embedding_dim, hidden_dim)
         self.lstm_bwd = nn.LSTMCell(embedding_dim, hidden_dim)
@@ -72,9 +130,45 @@ class BiLSTMTagger(nn.Module):
         self.lstm2_bwd = nn.LSTMCell(hidden_dim * 2, hidden_dim)
         self.hidden2tag = nn.Linear(hidden_dim * 2, tagset_size)
         # self.layer_norm = nn.LayerNorm(hidden_dim * 2)
+        self.mode = mode
 
-    def forward(self, sentence):
-        embeds = self.embedding(sentence)  # Shape: (batch_size, seq_len, embedding_dim)
+        if mode in ['a', 'd']:
+            self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        if mode in ['b', 'd']:
+            self.char_embedding = nn.Embedding(char_vocab_size, char_embedding_dim, padding_idx=PAD_CHAR_IDX)
+            self.char_lstm_fwd = nn.LSTMCell(char_embedding_dim, embedding_dim // 2)
+            self.char_lstm_bwd = nn.LSTMCell(char_embedding_dim, embedding_dim // 2)
+        if mode == 'c':
+            self.prefix_embedding = nn.Embedding(prefix_vocab_size, embedding_dim)
+            self.suffix_embedding = nn.Embedding(suffix_vocab_size, embedding_dim)
+        if mode == 'd':
+            self.embedding_final_linear = nn.Linear(embedding_dim * 2, embedding_dim)
+
+
+    def forward(self, sentence, char_sentence=None):
+        if self.mode == 'a':
+            embeds = self.embedding(sentence)  # Shape: (batch_size, seq_len, embedding_dim)
+        if self.mode == 'b':
+            batch_size, seq_len, max_word_len = char_sentence.size()
+            char_embeds = self.char_embedding(char_sentence)  # (batch, seq_len, max_word_len, char_embedding_dim)
+            word_embeds = []
+            for i in range(seq_len):
+                # Forward direction
+                h_fwd = torch.zeros(batch_size, self.embedding_dim // 2, device=char_embeds.device)
+                c_fwd = torch.zeros(batch_size, self.embedding_dim // 2, device=char_embeds.device)
+                # Backward direction
+                h_bwd = torch.zeros(batch_size, self.embedding_dim // 2, device=char_embeds.device)
+                c_bwd = torch.zeros(batch_size, self.embedding_dim // 2, device=char_embeds.device)
+                # Forward pass
+                for j in range(max_word_len):
+                    h_fwd, c_fwd = self.char_lstm_fwd(char_embeds[:, i, j, :], (h_fwd, c_fwd))
+                # Backward pass
+                for j in reversed(range(max_word_len)):
+                    h_bwd, c_bwd = self.char_lstm_bwd(char_embeds[:, i, j, :], (h_bwd, c_bwd))
+                # Concatenate final states
+                word_embeds.append(torch.cat([h_fwd, h_bwd], dim=1))
+            embeds = torch.stack(word_embeds, dim=1)  # (batch, seq_len, embedding_dim)
+
         batch_size, seq_len, _ = embeds.size()
 
         # First BiLSTM layer
@@ -134,36 +228,74 @@ def build_vocab(data_path):
                 tag_to_ix[tag] = len(tag_to_ix)
     return word_to_ix, tag_to_ix
 
+def build_char_vocab(data_path):
+    char_to_ix = {"<UNK>": 0}
+    tag_to_ix = {}
+    with open(data_path) as f:
+        for line in f:
+            if line.strip() == "":
+                continue
+            word, tag = line.strip().split()
+            for char in word:
+                if char not in char_to_ix:
+                    char_to_ix[char] = len(char_to_ix)
+            if tag not in tag_to_ix:
+                tag_to_ix[tag] = len(tag_to_ix)
+    return char_to_ix, tag_to_ix
+
 # === Training Procedure ===
 def train_model(train_path, dev_path, mode):
     device = torch.device(f"cuda:{GPU_NUMBER}" if torch.cuda.is_available() else "cpu")
 
-    word_to_ix, tag_to_ix = build_vocab(train_path)
-    train_data = TaggingDataset(train_path, word_to_ix, tag_to_ix)
-    dev_data = TaggingDataset(dev_path, word_to_ix, tag_to_ix)
+    # Default values for optional vocab sizes
+    vocab_size = 0
+    char_vocab_size = 0
+    prefix_vocab_size = 0
+    suffix_vocab_size = 0
 
-    train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True, collate_fn=TaggingDataset.collate_fn)
-    dev_loader = DataLoader(dev_data, batch_size=BATCH_SIZE, shuffle=False, collate_fn=TaggingDataset.collate_fn)
+    if mode == 'a':
+        word_to_ix, tag_to_ix = build_vocab(train_path)
+        train_data = TaggingDataset(train_path, word_to_ix, tag_to_ix)
+        dev_data = TaggingDataset(dev_path, word_to_ix, tag_to_ix)
+        train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True, collate_fn=TaggingDataset.collate_fn)
+        dev_loader = DataLoader(dev_data, batch_size=BATCH_SIZE, shuffle=False, collate_fn=TaggingDataset.collate_fn)
+        vocab_size = len(word_to_ix)
+        model = BiLSTMTagger(
+            vocab_size, char_vocab_size, prefix_vocab_size, suffix_vocab_size,
+            len(tag_to_ix), EMBEDDING_DIM, CHAR_EMBEDDING_DIM, HIDDEN_DIM, mode
+        ).to(device)
 
-    log_file = "train_log_pos.txt" if "pos" in train_path else "train_log_ner.txt"
+    if mode == 'b':
+        char_to_ix, tag_to_ix = build_char_vocab(train_path)
+        train_data = CharTaggingDataset(train_path, char_to_ix, tag_to_ix)
+        dev_data = CharTaggingDataset(dev_path, char_to_ix, tag_to_ix)
+        train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True, collate_fn=CharTaggingDataset.collate_fn)
+        dev_loader = DataLoader(dev_data, batch_size=BATCH_SIZE, shuffle=False, collate_fn=CharTaggingDataset.collate_fn)
+        char_vocab_size = len(char_to_ix)
+        model = BiLSTMTagger(
+            vocab_size, char_vocab_size, prefix_vocab_size, suffix_vocab_size,
+            len(tag_to_ix), EMBEDDING_DIM, CHAR_EMBEDDING_DIM, HIDDEN_DIM, mode
+        ).to(device)
 
-    model = BiLSTMTagger(len(word_to_ix), len(tag_to_ix), EMBEDDING_DIM, HIDDEN_DIM).to(device)
+    log_file_name = f"log_{mode}_{os.path.basename(train_path).split('.')[0]}.txt"
     loss_function = nn.CrossEntropyLoss(ignore_index=-1)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=1)
 
+    print(f"Training on {len(train_data)} sentences\n Starting training...")
 
-    print(f"Training on {len(train_data)} sentences with {len(word_to_ix)} words\n Starting training...")
-
-    with open(log_file, "w") as log_f:
+    with open(log_file_name, "w") as log_f:
         for epoch in range(EPOCHS):
             total_loss = 0.0
             start_time = time.time()
             for i, (sentences, tags) in enumerate(train_loader):
                 sentences, tags = sentences.to(device), tags.to(device)
                 model.zero_grad()
-                tag_scores = model(sentences)
-                loss = loss_function(tag_scores.view(-1, len(tag_to_ix)), tags.view(-1))
+                if mode == 'b':
+                    tag_scores = model(None, sentences)
+                else:
+                    tag_scores = model(sentences)
+                loss = loss_function(tag_scores.view(-1, tag_scores.size(-1)), tags.view(-1))
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
@@ -175,7 +307,10 @@ def train_model(train_path, dev_path, mode):
                     with torch.no_grad():
                         for dev_sentences, dev_tags in dev_loader:
                             dev_sentences, dev_tags = dev_sentences.to(device), dev_tags.to(device)
-                            dev_tag_scores = model(dev_sentences)
+                            if mode == 'b':
+                                dev_tag_scores = model(None, dev_sentences)
+                            else:
+                                dev_tag_scores = model(dev_sentences)
                             predicted_tags = torch.argmax(dev_tag_scores, dim=2)
                             mask = dev_tags != -1
                             if "ner" in train_path:
@@ -193,7 +328,10 @@ def train_model(train_path, dev_path, mode):
                             if batch_idx >= sample_size:
                                 break
                             train_sentences, train_tags = train_sentences.to(device), train_tags.to(device)
-                            train_tag_scores = model(train_sentences)
+                            if mode == 'b':
+                                train_tag_scores = model(None, train_sentences)
+                            else:
+                                train_tag_scores = model(train_sentences)
                             predicted_train_tags = torch.argmax(train_tag_scores, dim=2)
                             mask_train = train_tags != -1
                             if "ner" in train_path:
@@ -202,7 +340,6 @@ def train_model(train_path, dev_path, mode):
                             correct_train += (predicted_train_tags[mask_train] == train_tags[mask_train]).sum().item()
                             total_train += mask_train.sum().item()
                     train_accuracy = correct_train / total_train if total_train > 0 else 0
-
 
                     elapsed_time = time.time() - start_time
                     sentences_processed = (i + 1) * BATCH_SIZE
@@ -220,8 +357,11 @@ def train_model(train_path, dev_path, mode):
             with torch.no_grad():
                 for train_sentences, train_tags in train_loader:
                     train_sentences, train_tags = train_sentences.to(device), train_tags.to(device)
-                    train_tag_scores = model(train_sentences)
-                    train_loss += loss_function(train_tag_scores.view(-1, len(tag_to_ix)), train_tags.view(-1)).item()
+                    if mode == 'b':
+                        train_tag_scores = model(None, train_sentences)
+                    else:
+                        train_tag_scores = model(train_sentences)
+                    train_loss += loss_function(train_tag_scores.view(-1, train_tag_scores.size(-1)), train_tags.view(-1)).item()
 
             log_f.write(f"Epoch {epoch+1}: Train Loss = {train_loss:.4f}, Dev Loss = {total_loss:.4f}\n")
             print(f"Epoch {epoch+1}: Train Loss = {train_loss:.4f}, Dev Loss = {total_loss:.4f}")
@@ -237,6 +377,14 @@ if __name__ == "__main__":
     mode = sys.argv[1]  # Currently unused
     trainFile = sys.argv[2]  # Path to the training file
     modelFile = sys.argv[3]  # Path to save the trained model
+
+    if mode not in ['a', 'b', 'c', 'd']:
+        print("Invalid mode. Use 'a', 'b', 'c', or 'd'. [1st argument]")
+        sys.exit(1)
+
+    if not os.path.exists(trainFile):
+        print(f"Training file {trainFile} does not exist. [2nd argument]")
+        sys.exit(1)
 
     # Derive devFile from trainFile by replacing 'train' with 'dev'
     devFile = trainFile.replace("train", "dev")
