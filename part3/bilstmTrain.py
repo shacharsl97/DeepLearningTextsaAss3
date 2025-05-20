@@ -21,7 +21,7 @@ DROPOUT = 0.3
 
 PAD_CHAR_IDX = 0
 
-GPU_NUMBER = 5
+GPU_NUMBER = 1
 
 # === Dataset Handling ===
 class TaggingDataset(Dataset):
@@ -116,6 +116,66 @@ class CharTaggingDataset(Dataset):
         tags_padded = torch.stack(tags_padded)
         return sentences_padded, tags_padded
 
+class PrefixSuffixTaggingDataset(Dataset):
+    def __init__(self, data_path, word_to_ix, prefix_to_ix, suffix_to_ix, tag_to_ix):
+        self.sentences = []
+        self.prefixes = []
+        self.suffixes = []
+        self.labels = []
+        self.word_to_ix = word_to_ix
+        self.prefix_to_ix = prefix_to_ix
+        self.suffix_to_ix = suffix_to_ix
+        self.tag_to_ix = tag_to_ix
+        with open(data_path) as f:
+            sentence = []
+            prefixes = []
+            suffixes = []
+            tags = []
+            for line in f:
+                line = line.strip()
+                if line == "":
+                    if sentence:
+                        self.sentences.append(torch.tensor(sentence))
+                        self.prefixes.append(torch.tensor(prefixes))
+                        self.suffixes.append(torch.tensor(suffixes))
+                        self.labels.append(torch.tensor(tags))
+                        sentence = []
+                        prefixes = []
+                        suffixes = []
+                        tags = []
+                else:
+                    word, tag = line.split()
+                    word_idx = word_to_ix.get(word, word_to_ix["<UNK>"])
+                    pad_word = word + ("<PAD>" * (3 - len(word))) if len(word) < 3 else word
+                    prefix = pad_word[:3]
+                    suffix = pad_word[-3:]
+                    prefix_idx = prefix_to_ix.get(prefix, prefix_to_ix["<PAD>"])
+                    suffix_idx = suffix_to_ix.get(suffix, suffix_to_ix["<PAD>"])
+                    sentence.append(word_idx)
+                    prefixes.append(prefix_idx)
+                    suffixes.append(suffix_idx)
+                    tags.append(tag_to_ix[tag])
+            if sentence:
+                self.sentences.append(torch.tensor(sentence))
+                self.prefixes.append(torch.tensor(prefixes))
+                self.suffixes.append(torch.tensor(suffixes))
+                self.labels.append(torch.tensor(tags))
+
+    def __len__(self):
+        return len(self.sentences)
+
+    def __getitem__(self, idx):
+        return self.sentences[idx], self.prefixes[idx], self.suffixes[idx], self.labels[idx]
+
+    @staticmethod
+    def collate_fn(batch):
+        sentences, prefixes, suffixes, tags = zip(*batch)
+        sentences_padded = pad_sequence(sentences, batch_first=True, padding_value=0)
+        prefixes_padded = pad_sequence(prefixes, batch_first=True, padding_value=0)
+        suffixes_padded = pad_sequence(suffixes, batch_first=True, padding_value=0)
+        tags_padded = pad_sequence(tags, batch_first=True, padding_value=-1)
+        return sentences_padded, prefixes_padded, suffixes_padded, tags_padded
+
 # === Model Definition ===
 class BiLSTMTagger(nn.Module):
     def __init__(self, vocab_size, char_vocab_size, prefix_vocab_size, suffix_vocab_size,
@@ -132,7 +192,7 @@ class BiLSTMTagger(nn.Module):
         # self.layer_norm = nn.LayerNorm(hidden_dim * 2)
         self.mode = mode
 
-        if mode in ['a', 'd']:
+        if mode in ['a', 'c', 'd']:
             self.embedding = nn.Embedding(vocab_size, embedding_dim)
         if mode in ['b', 'd']:
             self.char_embedding = nn.Embedding(char_vocab_size, char_embedding_dim, padding_idx=PAD_CHAR_IDX)
@@ -145,7 +205,7 @@ class BiLSTMTagger(nn.Module):
             self.embedding_final_linear = nn.Linear(embedding_dim * 2, embedding_dim)
 
 
-    def forward(self, sentence, char_sentence=None):
+    def forward(self, sentence, char_sentence=None, prefix=None, suffix=None):
         if self.mode == 'a':
             embeds = self.embedding(sentence)  # Shape: (batch_size, seq_len, embedding_dim)
         if self.mode == 'b':
@@ -168,6 +228,12 @@ class BiLSTMTagger(nn.Module):
                 # Concatenate final states
                 word_embeds.append(torch.cat([h_fwd, h_bwd], dim=1))
             embeds = torch.stack(word_embeds, dim=1)  # (batch, seq_len, embedding_dim)
+
+        if self.mode == 'c':
+            word_embeds = self.embedding(sentence)  # (batch, seq_len, embedding_dim)
+            prefix_embeds = self.prefix_embedding(prefix)  # (batch, seq_len, embedding_dim)
+            suffix_embeds = self.suffix_embedding(suffix)  # (batch, seq_len, embedding_dim)
+            embeds = word_embeds + prefix_embeds + suffix_embeds
 
         batch_size, seq_len, _ = embeds.size()
 
@@ -243,6 +309,35 @@ def build_char_vocab(data_path):
                 tag_to_ix[tag] = len(tag_to_ix)
     return char_to_ix, tag_to_ix
 
+def build_prefix_suffix_vocab(data_path):
+    """
+    Builds prefix, suffix, word, and tag vocabularies from all words in the dataset.
+    Prefix/suffix is 3 chars, padded with '<PAD>' if word is shorter.
+    Returns: word_to_ix, prefix_to_ix, suffix_to_ix, tag_to_ix
+    """
+    word_to_ix = {"<UNK>": 0}
+    prefix_to_ix = {"<PAD>": 0}
+    suffix_to_ix = {"<PAD>": 0}
+    tag_to_ix = {}
+    with open(data_path) as f:
+        for line in f:
+            if line.strip() == "":
+                continue
+            word, tag = line.strip().split()
+            if word not in word_to_ix:
+                word_to_ix[word] = len(word_to_ix)
+            # Pad word if needed
+            pad_word = word + ("<PAD>" * (3 - len(word))) if len(word) < 3 else word
+            prefix = pad_word[:3]
+            suffix = pad_word[-3:]
+            if prefix not in prefix_to_ix:
+                prefix_to_ix[prefix] = len(prefix_to_ix)
+            if suffix not in suffix_to_ix:
+                suffix_to_ix[suffix] = len(suffix_to_ix)
+            if tag not in tag_to_ix:
+                tag_to_ix[tag] = len(tag_to_ix)
+    return word_to_ix, prefix_to_ix, suffix_to_ix, tag_to_ix
+
 # === Training Procedure ===
 def train_model(train_path, dev_path, mode):
     device = torch.device(f"cuda:{GPU_NUMBER}" if torch.cuda.is_available() else "cpu")
@@ -277,6 +372,20 @@ def train_model(train_path, dev_path, mode):
             len(tag_to_ix), EMBEDDING_DIM, CHAR_EMBEDDING_DIM, HIDDEN_DIM, mode
         ).to(device)
 
+    if mode == 'c':
+        word_to_ix, prefix_to_ix, suffix_to_ix, tag_to_ix = build_prefix_suffix_vocab(train_path)
+        train_data = PrefixSuffixTaggingDataset(train_path, word_to_ix, prefix_to_ix, suffix_to_ix, tag_to_ix)
+        dev_data = PrefixSuffixTaggingDataset(dev_path, word_to_ix, prefix_to_ix, suffix_to_ix, tag_to_ix)
+        train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True, collate_fn=PrefixSuffixTaggingDataset.collate_fn)
+        dev_loader = DataLoader(dev_data, batch_size=BATCH_SIZE, shuffle=False, collate_fn=PrefixSuffixTaggingDataset.collate_fn)
+        vocab_size = len(word_to_ix)
+        prefix_vocab_size = len(prefix_to_ix)
+        suffix_vocab_size = len(suffix_to_ix)
+        model = BiLSTMTagger(
+            vocab_size, char_vocab_size, prefix_vocab_size, suffix_vocab_size,
+            len(tag_to_ix), EMBEDDING_DIM, CHAR_EMBEDDING_DIM, HIDDEN_DIM, mode
+        ).to(device)
+
     log_file_name = f"log_{mode}_{os.path.basename(train_path).split('.')[0]}.txt"
     loss_function = nn.CrossEntropyLoss(ignore_index=-1)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
@@ -288,12 +397,21 @@ def train_model(train_path, dev_path, mode):
         for epoch in range(EPOCHS):
             total_loss = 0.0
             start_time = time.time()
-            for i, (sentences, tags) in enumerate(train_loader):
-                sentences, tags = sentences.to(device), tags.to(device)
-                model.zero_grad()
-                if mode == 'b':
+            for i, batch in enumerate(train_loader):
+                if mode == 'c':
+                    sentences, prefixes, suffixes, tags = batch
+                    sentences, prefixes, suffixes, tags = sentences.to(device), prefixes.to(device), suffixes.to(device), tags.to(device)
+                    model.zero_grad()
+                    tag_scores = model(sentences, None, prefixes, suffixes)
+                elif mode == 'b':
+                    sentences, tags = batch
+                    sentences, tags = sentences.to(device), tags.to(device)
+                    model.zero_grad()
                     tag_scores = model(None, sentences)
                 else:
+                    sentences, tags = batch
+                    sentences, tags = sentences.to(device), tags.to(device)
+                    model.zero_grad()
                     tag_scores = model(sentences)
                 loss = loss_function(tag_scores.view(-1, tag_scores.size(-1)), tags.view(-1))
                 loss.backward()
