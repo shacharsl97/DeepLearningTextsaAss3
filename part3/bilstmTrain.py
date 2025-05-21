@@ -7,6 +7,7 @@ from collections import defaultdict
 import numpy as np
 import time
 from torch.nn.utils.rnn import pad_sequence
+import pickle
 
 # === Hyperparameters ===
 EMBEDDING_DIM = 200
@@ -19,7 +20,7 @@ DROPOUT = 0.25
 
 PAD_CHAR_IDX = 0
 
-GPU_NUMBER = 1
+GPU_NUMBER = 0
 
 # === Dataset Handling ===
 class TaggingDataset(Dataset):
@@ -477,7 +478,8 @@ def train_model(train_path, dev_path, mode):
             len(tag_to_ix), EMBEDDING_DIM, CHAR_EMBEDDING_DIM, HIDDEN_DIM, mode
         ).to(device)
 
-    log_file_name = f"log_{mode}_{os.path.basename(train_path).split('.')[0]}.txt"
+    
+    log_file_name = f"log_{mode}_{train_path[0:3]}.txt"
     loss_function = nn.CrossEntropyLoss(ignore_index=-1)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.65, patience=2)
@@ -616,7 +618,14 @@ def train_model(train_path, dev_path, mode):
             log_f.write(f"Epoch {epoch+1}: Loss = {total_loss:.4f}\n")
             print(f"Epoch {epoch+1}: Loss = {total_loss:.4f}")
 
-    return model
+    if mode == 'a':
+        return model, (word_to_ix, tag_to_ix)
+    elif mode == 'b':
+        return model, (char_to_ix, tag_to_ix)
+    elif mode == 'c':
+        return model, (word_to_ix, prefix_to_ix, suffix_to_ix, tag_to_ix)
+    elif mode == 'd':
+        return model, (word_to_ix, char_to_ix, tag_to_ix)
 
 # === Entry Point ===
 if __name__ == "__main__":
@@ -637,7 +646,34 @@ if __name__ == "__main__":
     devFile = trainFile.replace("train", "dev")
 
     # Train the model
-    model = train_model(trainFile, devFile, mode)
+    model, vocabs = train_model(trainFile, devFile, mode)
 
     # Save the trained model
     torch.save(model.state_dict(), modelFile)
+
+    # Save vocabularies and mode for prediction
+    vocabs_to_save = {'mode': mode}
+    if mode == 'a':
+        word_to_ix, tag_to_ix = vocabs
+        vocabs_to_save['word_to_ix'] = word_to_ix
+        vocabs_to_save['tag_to_ix'] = tag_to_ix
+    elif mode == 'b':
+        char_to_ix, tag_to_ix = vocabs
+        vocabs_to_save['char_to_ix'] = char_to_ix
+        vocabs_to_save['tag_to_ix'] = tag_to_ix
+    elif mode == 'c':
+        word_to_ix, prefix_to_ix, suffix_to_ix, tag_to_ix = vocabs
+        vocabs_to_save['word_to_ix'] = word_to_ix
+        vocabs_to_save['prefix_to_ix'] = prefix_to_ix
+        vocabs_to_save['suffix_to_ix'] = suffix_to_ix
+        vocabs_to_save['tag_to_ix'] = tag_to_ix
+    elif mode == 'd':
+        word_to_ix, char_to_ix, tag_to_ix = vocabs
+        vocabs_to_save['word_to_ix'] = word_to_ix
+        vocabs_to_save['char_to_ix'] = char_to_ix
+        vocabs_to_save['tag_to_ix'] = tag_to_ix
+    with open(modelFile + '.vocabs', 'wb') as f:
+        pickle.dump(vocabs_to_save, f)
+
+    print(f"Model saved to {modelFile}")
+    print(f"Vocabularies saved to {modelFile}.vocabs")
